@@ -1,3 +1,4 @@
+from math import floor
 import requests
 import json
 import sqlite3
@@ -68,7 +69,7 @@ def getSummaryData():
         buy_price = line[columns.index("buy")]
         sell_price = line[columns.index("sell")]
         percent_profit = (
-            ((sell_price - 1) * 0.85 - (buy_price + 1)) / (buy_price + 1) * 100
+            (floor((sell_price - 1) * 0.8) - (buy_price + 1)) / (buy_price + 1) * 100
         )
         timestamp = datetime.datetime.fromtimestamp(time_updated / 1000.0)
 
