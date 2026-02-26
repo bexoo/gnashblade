@@ -218,20 +218,21 @@ def calculate_flip_result(
         return None
 
     if days == 1:
-        buy_vel = item.buy_velocity_1d or 0.0
-        sell_vel = item.sell_velocity_1d or 0.0
         buy_sold = item.buy_sold_1d or 0
         sell_sold = item.sell_sold_1d or 0
     elif days == 7:
-        buy_vel = item.buy_velocity_7d or 0.0
-        sell_vel = item.sell_velocity_7d or 0.0
         buy_sold = item.buy_sold_7d or 0
         sell_sold = item.sell_sold_7d or 0
     else:
-        buy_vel = item.buy_velocity_30d or 0.0
-        sell_vel = item.sell_velocity_30d or 0.0
         buy_sold = item.buy_sold_30d or 0
         sell_sold = item.sell_sold_30d or 0
+
+    if buy_sold <= 0 or sell_sold <= 0:
+        return None
+
+    divisor = float(days)
+    buy_vel = ((buy_sold / divisor) * item.buy_price) / 10000.0
+    sell_vel = ((sell_sold / divisor) * item.sell_price) / 10000.0
 
     if buy_vel <= 0 or sell_vel <= 0:
         return None

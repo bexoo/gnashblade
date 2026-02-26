@@ -65,6 +65,7 @@ venv.bak/
 Thumbs.db
 
 # Project specific
+*.db
 gw2.db
 *.db-journal
 COMMON_TASKS.md

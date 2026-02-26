@@ -4,7 +4,7 @@ from lib.database import Database
 from lib.models import ItemPrice
 
 
-def test_update_item_velocity_bulk_updates_multiple_rows(tmp_path):
+def test_update_item_history_bulk_and_recompute_updates_multiple_rows(tmp_path):
     db_path = tmp_path / "test_bulk_velocity.db"
     db = Database(str(db_path))
     db.upsert_items(
@@ -17,12 +17,6 @@ def test_update_item_velocity_bulk_updates_multiple_rows(tmp_path):
     updates = [
         (
             1,
-            10.0,
-            20.0,
-            70.0,
-            140.0,
-            300.0,
-            600.0,
             1,
             2,
             7,
@@ -37,12 +31,6 @@ def test_update_item_velocity_bulk_updates_multiple_rows(tmp_path):
         ),
         (
             2,
-            11.0,
-            21.0,
-            71.0,
-            141.0,
-            301.0,
-            601.0,
             3,
             4,
             8,
@@ -57,26 +45,49 @@ def test_update_item_velocity_bulk_updates_multiple_rows(tmp_path):
         ),
     ]
 
-    db.update_item_velocity_bulk(updates)
+    db.update_item_history_bulk(updates)
+    db.recompute_derived_metrics()
 
     item_1 = db.get_item(1)
     item_2 = db.get_item(2)
     assert item_1 is not None
     assert item_2 is not None
 
-    assert item_1.buy_velocity_1d == pytest.approx(10.0)
-    assert item_1.sell_velocity_1d == pytest.approx(20.0)
+    assert item_1.buy_velocity_1d == pytest.approx(0.01)
+    assert item_1.sell_velocity_1d == pytest.approx(0.04)
     assert item_1.buy_sold_30d == 30
     assert item_1.buy_price_min_yesterday == 99
     assert item_1.sell_price_max_yesterday == 205
+    assert item_1.flip_score > 0
     assert item_1.velocity_updated is not None
 
-    assert item_2.buy_velocity_1d == pytest.approx(11.0)
-    assert item_2.sell_velocity_1d == pytest.approx(21.0)
+    assert item_2.buy_velocity_1d == pytest.approx(0.045)
+    assert item_2.sell_velocity_1d == pytest.approx(0.1)
     assert item_2.buy_sold_30d == 31
     assert item_2.buy_price_min_yesterday == 149
     assert item_2.sell_price_max_yesterday == 255
+    assert item_2.flip_score > 0
     assert item_2.velocity_updated is not None
+
+
+def test_upsert_items_preserves_history_derived_metrics(tmp_path):
+    db_path = tmp_path / "test_preserve_derived.db"
+    db = Database(str(db_path))
+    db.upsert_items([ItemPrice(id=1, name="Item 1", buy_price=100, sell_price=200)])
+    db.update_item_history_bulk([(1, 5, 10, 35, 70, 150, 300, 1.0, 1.0, 0.0, 99, 205)])
+    db.recompute_derived_metrics()
+
+    before = db.get_item(1)
+    assert before is not None
+    assert before.buy_sold_1d == 5
+    assert before.flip_score is not None and before.flip_score > 0
+
+    db.upsert_items([ItemPrice(id=1, name="Item 1", buy_price=110, sell_price=220)])
+
+    after = db.get_item(1)
+    assert after is not None
+    assert after.buy_sold_1d == 5
+    assert after.flip_score == before.flip_score
 
 
 def test_update_item_order_book_bulk_updates_multiple_rows(tmp_path):

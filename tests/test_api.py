@@ -55,12 +55,18 @@ def test_fetch_history_batch_returns_all_ids_and_handles_failures(monkeypatch):
 def test_fetch_order_books_batch_returns_only_successful_results(monkeypatch):
     client = GW2Client()
 
-    def fake_fetch_order_book(item_id: int):
-        if item_id == 2:
-            return None
-        return OrderBook(item_id=item_id, buys=[{"unit_price": 10, "quantity": 1}])
+    def fake_fetch_order_books_chunk(item_ids: list[int]):
+        results = {}
+        for item_id in item_ids:
+            if item_id == 2:
+                continue
+            results[item_id] = OrderBook(
+                item_id=item_id,
+                buys=[{"unit_price": 10, "quantity": 1}],
+            )
+        return results
 
-    monkeypatch.setattr(client, "fetch_order_book", fake_fetch_order_book)
+    monkeypatch.setattr(client, "_fetch_order_books_chunk", fake_fetch_order_books_chunk)
 
     results = client.fetch_order_books_batch([1, 2, 3], max_workers=3)
 

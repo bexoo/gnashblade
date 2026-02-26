@@ -253,17 +253,41 @@ class GW2Client:
         if not item_ids:
             return {}
 
-        worker_count = max(1, min(max_workers, len(item_ids)))
+        chunk_size = 200
         results: dict[int, OrderBook] = {}
 
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            future_to_item_id = {
-                executor.submit(self.fetch_order_book, item_id): item_id
-                for item_id in item_ids
-            }
-            for future in as_completed(future_to_item_id):
-                item_id = future_to_item_id[future]
-                order_book = future.result()
-                if order_book:
-                    results[item_id] = order_book
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = []
+            for i in range(0, len(item_ids), chunk_size):
+                chunk = item_ids[i:i + chunk_size]
+                futures.append(executor.submit(self._fetch_order_books_chunk, chunk))
+
+            for future in as_completed(futures):
+                chunk_results = future.result()
+                results.update(chunk_results)
+
         return results
+
+    def _fetch_order_books_chunk(self, item_ids: list[int]) -> dict[int, OrderBook]:
+        """Fetch order books for multiple items using batch API."""
+        if not item_ids:
+            return {}
+
+        ids_str = ",".join(map(str, item_ids))
+        url = f"{self.BASE_URL}/commerce/listings?ids={ids_str}"
+
+        try:
+            response = self._request(url)
+            data = response.json()
+            results = {}
+            for item_data in data:
+                item_id = item_data.get("id")
+                if item_id is not None:
+                    results[item_id] = OrderBook(
+                        item_id=item_id,
+                        buys=item_data.get("buys", []),
+                        sells=item_data.get("sells", []),
+                    )
+            return results
+        except requests.RequestException:
+            return {}

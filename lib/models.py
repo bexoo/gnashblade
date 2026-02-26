@@ -30,6 +30,7 @@ class Item:
     price_pressure: Optional[float] = None
     buy_price_min_yesterday: Optional[int] = None
     sell_price_max_yesterday: Optional[int] = None
+    flip_score: Optional[float] = None
     listed_ratio: Optional[float] = None
     delisted_ratio: Optional[float] = None
     spread_percent: Optional[float] = None
@@ -137,15 +138,3 @@ class ItemPrice:
     buy_quantity: Optional[int] = None
     sell_quantity: Optional[int] = None
     vendor_value: Optional[int] = None
-    buy_velocity_1d: Optional[float] = None
-    sell_velocity_1d: Optional[float] = None
-    buy_velocity_7d: Optional[float] = None
-    sell_velocity_7d: Optional[float] = None
-    buy_velocity_30d: Optional[float] = None
-    sell_velocity_30d: Optional[float] = None
-    buy_sold_1d: Optional[int] = None
-    sell_sold_1d: Optional[int] = None
-    buy_sold_7d: Optional[int] = None
-    sell_sold_7d: Optional[int] = None
-    buy_sold_30d: Optional[int] = None
-    sell_sold_30d: Optional[int] = None

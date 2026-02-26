@@ -21,6 +21,7 @@ def test_cmd_update_always_uses_deep_refresh(monkeypatch):
         silent=True,
         history_workers=16,
         orderbook_workers=24,
+        fetch_order_books=False,
     )
     result = gw2_trader.cmd_update(args)
 
@@ -59,6 +60,7 @@ def test_cmd_watch_respects_deep_refresh_seconds(monkeypatch):
         deep_refresh_seconds=180,
         history_workers=12,
         orderbook_workers=12,
+        fetch_order_books=False,
         limit=10,
         min_profit=0.0,
         max_profit=None,

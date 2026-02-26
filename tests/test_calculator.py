@@ -161,8 +161,6 @@ class TestCalculateFlipResult:
             sell_price=150,
             buy_quantity=100,
             sell_quantity=100,
-            buy_velocity_1d=10.0,
-            sell_velocity_1d=15.0,
             buy_sold_1d=10,
             sell_sold_1d=15,
         )
@@ -170,15 +168,15 @@ class TestCalculateFlipResult:
 
         assert result is not None
         assert result.percent_profit > 0
-        assert result.flip_velocity == 10.0
+        assert result.flip_velocity == 0.1
         assert result.flip_score > 0
 
     def test_missing_prices(self):
-        item = Item(id=1, name="Test Item", buy_velocity_1d=10.0, sell_velocity_1d=15.0)
+        item = Item(id=1, name="Test Item", buy_sold_1d=10, sell_sold_1d=15)
         result = calculate_flip_result(item, days=1)
         assert result is None
 
-    def test_missing_velocity(self):
+    def test_missing_quantities(self):
         item = Item(id=1, name="Test Item", buy_price=100, sell_price=150)
         result = calculate_flip_result(item, days=1)
         assert result is None
@@ -191,12 +189,6 @@ class TestCalculateFlipResult:
             sell_price=150,
             buy_quantity=100,
             sell_quantity=100,
-            buy_velocity_1d=10.0,
-            sell_velocity_1d=15.0,
-            buy_velocity_7d=50.0,
-            sell_velocity_7d=75.0,
-            buy_velocity_30d=200.0,
-            sell_velocity_30d=300.0,
             buy_sold_1d=10,
             sell_sold_1d=15,
             buy_sold_7d=50,
@@ -209,9 +201,9 @@ class TestCalculateFlipResult:
         result_7d = calculate_flip_result(item, days=7)
         result_30d = calculate_flip_result(item, days=30)
 
-        assert result_1d.flip_velocity == 10.0
-        assert result_7d.flip_velocity == 50.0
-        assert result_30d.flip_velocity == 200.0
+        assert result_1d.flip_velocity == pytest.approx(0.1)
+        assert result_7d.flip_velocity == pytest.approx((50 / 7) * 100 / 10000)
+        assert result_30d.flip_velocity == pytest.approx((200 / 30) * 100 / 10000)
 
 
 class TestOrderBook:

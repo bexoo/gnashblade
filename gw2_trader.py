@@ -10,7 +10,6 @@ from lib.calculator import (
     calc_order_book_competition,
     calc_price_pressure,
     calc_quantity_sold,
-    calc_velocity,
     calculate_flip_result,
     get_yesterday_floor_prices,
 )
@@ -95,6 +94,7 @@ def _run_update_cycle(
     deep_refresh: bool,
     history_workers: int,
     orderbook_workers: int,
+    fetch_order_books: bool,
 ) -> None:
     cycle_started = time.perf_counter()
 
@@ -117,7 +117,8 @@ def _run_update_cycle(
         item_ids_missing = [item.id for item in missing_items]
         vendor_data = gw2.fetch_items_batch(item_ids_missing)
         vendor_values = {
-            item_id: data.get("vendor_value", 0) for item_id, data in vendor_data.items()
+            item_id: data.get("vendor_value", 0)
+            for item_id, data in vendor_data.items()
         }
         if vendor_values:
             vlog(f"Updating {len(vendor_values)} vendor values in database...")
@@ -125,6 +126,10 @@ def _run_update_cycle(
     _log_stage_timing("vendor value refresh", vendor_started)
 
     if not deep_refresh:
+        derive_started = time.perf_counter()
+        log("Recomputing derived metrics from stored quantities...")
+        db.recompute_derived_metrics()
+        _log_stage_timing("recompute derived metrics", derive_started)
         log("Skipping deep refresh (history/order books) this cycle.")
         _log_stage_timing("total update cycle", cycle_started)
         return
@@ -151,29 +156,22 @@ def _run_update_cycle(
     )
     _log_stage_timing("fetch history", history_started)
 
-    log("Calculating velocity and competition metrics...")
+    log("Calculating quantity and competition metrics...")
     calc_started = time.perf_counter()
-    velocity_updates = []
+    history_updates = []
     floor_price_map: dict[int, tuple[int, Optional[int]]] = {}
     for item_id, history in history_data.items():
         if not history:
             continue
 
-        velocities = calc_velocity(history)
         quantities = calc_quantity_sold(history)
         buy_ratio, sell_ratio = calc_competition_ratio(history)
         pressure = calc_price_pressure(history)
         buy_floor, sell_ceil = get_yesterday_floor_prices(history)
 
-        velocity_updates.append(
+        history_updates.append(
             (
                 item_id,
-                velocities[0],
-                velocities[1],
-                velocities[2],
-                velocities[3],
-                velocities[4],
-                velocities[5],
                 quantities[0],
                 quantities[1],
                 quantities[2],
@@ -192,37 +190,46 @@ def _run_update_cycle(
             floor_price_map[item_id] = (buy_floor, sell_ceil)
     _log_stage_timing("calculate velocity metrics", calc_started)
 
-    velocity_write_started = time.perf_counter()
-    db.update_item_velocity_bulk(velocity_updates)
-    _log_stage_timing("write velocity metrics", velocity_write_started)
+    history_write_started = time.perf_counter()
+    db.update_item_history_bulk(history_updates)
+    _log_stage_timing("write history metrics", history_write_started)
+
+    derive_started = time.perf_counter()
+    log("Recomputing derived metrics from stored quantities...")
+    db.recompute_derived_metrics()
+    _log_stage_timing("recompute derived metrics", derive_started)
 
     order_book_item_ids = list(floor_price_map.keys())
-    log(
-        f"Fetching order books for {len(order_book_item_ids)} candidates "
-        f"({max(1, orderbook_workers)} workers)..."
-    )
-    order_book_fetch_started = time.perf_counter()
-    order_books = gw2.fetch_order_books_batch(
-        order_book_item_ids,
-        max_workers=orderbook_workers,
-    )
-    _log_stage_timing("fetch order books", order_book_fetch_started)
-
-    order_book_calc_started = time.perf_counter()
-    order_book_updates = []
-    for item_id, order_book in order_books.items():
-        buy_floor, sell_ceil = floor_price_map[item_id]
-        buy_gold, buy_tiers, _, _ = calc_order_book_competition(
-            order_book,
-            buy_floor,
-            sell_ceil,
+    if fetch_order_books:
+        log(
+            f"Fetching order books for {len(order_book_item_ids)} candidates "
+            f"({max(1, orderbook_workers)} workers)..."
         )
-        order_book_updates.append((item_id, buy_gold, buy_tiers))
-    _log_stage_timing("calculate order book metrics", order_book_calc_started)
+        order_book_fetch_started = time.perf_counter()
+        order_books = gw2.fetch_order_books_batch(
+            order_book_item_ids,
+            max_workers=orderbook_workers,
+        )
+        _log_stage_timing("fetch order books", order_book_fetch_started)
 
-    order_book_write_started = time.perf_counter()
-    db.update_item_order_book_bulk(order_book_updates)
-    _log_stage_timing("write order book metrics", order_book_write_started)
+        order_book_calc_started = time.perf_counter()
+        order_book_updates = []
+        for item_id, order_book in order_books.items():
+            buy_floor, sell_ceil = floor_price_map[item_id]
+            buy_gold, buy_tiers, _, _ = calc_order_book_competition(
+                order_book,
+                buy_floor,
+                sell_ceil,
+            )
+            order_book_updates.append((item_id, buy_gold, buy_tiers))
+        _log_stage_timing("calculate order book metrics", order_book_calc_started)
+
+        order_book_write_started = time.perf_counter()
+        db.update_item_order_book_bulk(order_book_updates)
+        _log_stage_timing("write order book metrics", order_book_write_started)
+    else:
+        log("Skipping order book fetch (use --fetch-order-books to enable)")
+        order_books = {}
     _log_stage_timing("total update cycle", cycle_started)
 
 
@@ -243,6 +250,7 @@ def cmd_update(args: argparse.Namespace) -> int:
         deep_refresh=True,
         history_workers=args.history_workers,
         orderbook_workers=args.orderbook_workers,
+        fetch_order_books=args.fetch_order_books,
     )
 
     log("Update complete!")
@@ -257,11 +265,15 @@ def cmd_flips(args: argparse.Namespace) -> int:
     for item in items:
         if item.sell_price and item.sell_price > args.max_price:
             continue
-        # Filter by 7-day average daily velocity
-        if item.sell_velocity_7d and (item.sell_velocity_7d / 7) < args.min_sold:
+
+        # Filter by 7-day average daily quantity sold/bought
+        avg_daily_sold = (item.sell_sold_7d or 0) / 7
+        avg_daily_bought = (item.buy_sold_7d or 0) / 7
+        if avg_daily_sold < args.min_sold:
             continue
-        if item.buy_velocity_7d and (item.buy_velocity_7d / 7) < args.min_bought:
+        if avg_daily_bought < args.min_bought:
             continue
+
         result = calculate_flip_result(item, days=args.days)
         if result and result.flip_score > 0:
             if result.percent_profit >= args.min_profit:
@@ -426,7 +438,7 @@ def cmd_item(args: argparse.Namespace) -> int:
     else:
         print("  30-day: N/A")
 
-    # Velocity / History
+    # Velocity / Volume
     print("\nVelocity (gold/day):")
     print("  Buy orders:")
     print(f"    1-day:  {format_velocity(item.buy_velocity_1d or 0)}")
@@ -436,6 +448,16 @@ def cmd_item(args: argparse.Namespace) -> int:
     print(f"    1-day:  {format_velocity(item.sell_velocity_1d or 0)}")
     print(f"    7-day:  {format_velocity(item.sell_velocity_7d or 0)}")
     print(f"    30-day: {format_velocity(item.sell_velocity_30d or 0)}")
+
+    print("\nVolume (items/day):")
+    print("  Bought:")
+    print(f"    1-day:  {item.buy_sold_1d or 0:,}")
+    print(f"    7-day:  {item.buy_sold_7d or 0:,}")
+    print(f"    30-day: {item.buy_sold_30d or 0:,}")
+    print("  Sold:")
+    print(f"    1-day:  {item.sell_sold_1d or 0:,}")
+    print(f"    7-day:  {item.sell_sold_7d or 0:,}")
+    print(f"    30-day: {item.sell_sold_30d or 0:,}")
 
     # Competition metrics
     print("\nCompetition:")
@@ -491,6 +513,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 deep_refresh=deep_refresh_due,
                 history_workers=args.history_workers,
                 orderbook_workers=args.orderbook_workers,
+                fetch_order_books=args.fetch_order_books,
             )
             if deep_refresh_due:
                 last_deep_refresh_at = now
@@ -551,6 +574,11 @@ def main() -> int:
         default=32,
         help="Number of parallel workers for GW2 order book fetches (default: 32)",
     )
+    update_parser.add_argument(
+        "--fetch-order-books",
+        action="store_true",
+        help="Fetch order books (slow, ~2s). Without this, only prices/velocity are updated",
+    )
 
     flips_parser = subparsers.add_parser("flips", help="Show best flip opportunities")
     flips_parser.add_argument(
@@ -589,14 +617,14 @@ def main() -> int:
     flips_parser.add_argument(
         "--min-sold",
         type=int,
-        default=1,
+        default=24,
         help="Minimum average daily sells (default: 1). "
         "E.g., 5 = only show items that sell 5+ per day on average (over 7 days)",
     )
     flips_parser.add_argument(
         "--min-bought",
         type=int,
-        default=1,
+        default=24,
         help="Minimum average daily buys (default: 1). "
         "E.g., 5 = only show items that have 5+ buy orders per day on average (over 7 days)",
     )
@@ -640,6 +668,11 @@ def main() -> int:
         help="Number of parallel workers for GW2 order book fetches (default: 32)",
     )
     watch_parser.add_argument(
+        "--fetch-order-books",
+        action="store_true",
+        help="Fetch order books during deep refresh (slow, ~2s)",
+    )
+    watch_parser.add_argument(
         "--limit",
         type=int,
         default=10,
@@ -668,14 +701,14 @@ def main() -> int:
     watch_parser.add_argument(
         "--min-sold",
         type=int,
-        default=1,
+        default=24,
         help="Minimum average daily sells (default: 1). "
         "E.g., 5 = only show items that sell 5+ per day on average (over 7 days)",
     )
     watch_parser.add_argument(
         "--min-bought",
         type=int,
-        default=1,
+        default=24,
         help="Minimum average daily buys (default: 1). "
         "E.g., 5 = only show items that have 5+ buy orders per day on average (over 7 days)",
     )

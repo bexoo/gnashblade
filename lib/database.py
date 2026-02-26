@@ -2,16 +2,11 @@ import sqlite3
 from datetime import datetime
 from typing import Optional
 
+from lib.calculator import calc_flip_score, calc_percent_profit
 from lib.models import Item, ItemPrice
 
-VelocityUpdateRow = tuple[
+HistoryUpdateRow = tuple[
     int,
-    float,
-    float,
-    float,
-    float,
-    float,
-    float,
     int,
     int,
     int,
@@ -70,11 +65,19 @@ class Database:
                 price_pressure REAL,
                 buy_price_min_yesterday INTEGER,
                 sell_price_max_yesterday INTEGER,
+                flip_score REAL,
                 price_updated TEXT,
                 velocity_updated TEXT
             )
         """
         )
+
+        existing_columns = {
+            row[1]
+            for row in cursor.execute("PRAGMA table_info(items)").fetchall()
+        }
+        if "flip_score" not in existing_columns:
+            cursor.execute("ALTER TABLE items ADD COLUMN flip_score REAL")
 
         conn.commit()
         conn.close()
@@ -100,14 +103,8 @@ class Database:
                 """
                 INSERT INTO items
                     (id, name, buy_price, sell_price, buy_quantity,
-                     sell_quantity, vendor_value, price_updated,
-                     buy_velocity_1d, sell_velocity_1d,
-                     buy_velocity_7d, sell_velocity_7d,
-                     buy_velocity_30d, sell_velocity_30d,
-                     buy_sold_1d, sell_sold_1d,
-                     buy_sold_7d, sell_sold_7d,
-                     buy_sold_30d, sell_sold_30d)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     sell_quantity, vendor_value, price_updated)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     name = excluded.name,
                     buy_price = excluded.buy_price,
@@ -115,19 +112,7 @@ class Database:
                     buy_quantity = excluded.buy_quantity,
                     sell_quantity = excluded.sell_quantity,
                     vendor_value = COALESCE(excluded.vendor_value, items.vendor_value),
-                    price_updated = excluded.price_updated,
-                    buy_velocity_1d = excluded.buy_velocity_1d,
-                    sell_velocity_1d = excluded.sell_velocity_1d,
-                    buy_velocity_7d = excluded.buy_velocity_7d,
-                    sell_velocity_7d = excluded.sell_velocity_7d,
-                    buy_velocity_30d = excluded.buy_velocity_30d,
-                    sell_velocity_30d = excluded.sell_velocity_30d,
-                    buy_sold_1d = excluded.buy_sold_1d,
-                    sell_sold_1d = excluded.sell_sold_1d,
-                    buy_sold_7d = excluded.buy_sold_7d,
-                    sell_sold_7d = excluded.sell_sold_7d,
-                    buy_sold_30d = excluded.buy_sold_30d,
-                    sell_sold_30d = excluded.sell_sold_30d
+                    price_updated = excluded.price_updated
                 """,
                 (
                     item.id,
@@ -138,33 +123,15 @@ class Database:
                     item.sell_quantity,
                     item.vendor_value,
                     now,
-                    item.buy_velocity_1d,
-                    item.sell_velocity_1d,
-                    item.buy_velocity_7d,
-                    item.sell_velocity_7d,
-                    item.buy_velocity_30d,
-                    item.sell_velocity_30d,
-                    item.buy_sold_1d,
-                    item.sell_sold_1d,
-                    item.buy_sold_7d,
-                    item.sell_sold_7d,
-                    item.buy_sold_30d,
-                    item.sell_sold_30d,
                 ),
             )
 
         conn.commit()
         conn.close()
 
-    def update_item_velocity(
+    def update_item_history(
         self,
         item_id: int,
-        buy_velocity_1d: float,
-        sell_velocity_1d: float,
-        buy_velocity_7d: float,
-        sell_velocity_7d: float,
-        buy_velocity_30d: float,
-        sell_velocity_30d: float,
         buy_sold_1d: int,
         sell_sold_1d: int,
         buy_sold_7d: int,
@@ -177,16 +144,10 @@ class Database:
         buy_price_min_yesterday: Optional[int],
         sell_price_max_yesterday: Optional[int],
     ) -> None:
-        self.update_item_velocity_bulk(
+        self.update_item_history_bulk(
             [
                 (
                     item_id,
-                    buy_velocity_1d,
-                    sell_velocity_1d,
-                    buy_velocity_7d,
-                    sell_velocity_7d,
-                    buy_velocity_30d,
-                    sell_velocity_30d,
                     buy_sold_1d,
                     sell_sold_1d,
                     buy_sold_7d,
@@ -202,7 +163,7 @@ class Database:
             ]
         )
 
-    def update_item_velocity_bulk(self, updates: list[VelocityUpdateRow]) -> None:
+    def update_item_history_bulk(self, updates: list[HistoryUpdateRow]) -> None:
         if not updates:
             return
 
@@ -213,12 +174,6 @@ class Database:
 
         rows = [
             (
-                buy_velocity_1d,
-                sell_velocity_1d,
-                buy_velocity_7d,
-                sell_velocity_7d,
-                buy_velocity_30d,
-                sell_velocity_30d,
                 buy_sold_1d,
                 sell_sold_1d,
                 buy_sold_7d,
@@ -235,12 +190,6 @@ class Database:
             )
             for (
                 item_id,
-                buy_velocity_1d,
-                sell_velocity_1d,
-                buy_velocity_7d,
-                sell_velocity_7d,
-                buy_velocity_30d,
-                sell_velocity_30d,
                 buy_sold_1d,
                 sell_sold_1d,
                 buy_sold_7d,
@@ -258,12 +207,6 @@ class Database:
         cursor.executemany(
             """
             UPDATE items SET
-                buy_velocity_1d = ?,
-                sell_velocity_1d = ?,
-                buy_velocity_7d = ?,
-                sell_velocity_7d = ?,
-                buy_velocity_30d = ?,
-                sell_velocity_30d = ?,
                 buy_sold_1d = ?,
                 sell_sold_1d = ?,
                 buy_sold_7d = ?,
@@ -279,6 +222,92 @@ class Database:
             WHERE id = ?
             """,
             rows,
+        )
+
+        conn.commit()
+        conn.close()
+
+    def recompute_derived_metrics(self) -> None:
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                id,
+                buy_price,
+                sell_price,
+                vendor_value,
+                buy_sold_1d,
+                sell_sold_1d,
+                buy_sold_7d,
+                sell_sold_7d,
+                buy_sold_30d,
+                sell_sold_30d
+            FROM items
+            """
+        )
+        rows = cursor.fetchall()
+
+        updates = []
+        for row in rows:
+            buy_price = row["buy_price"] or 0
+            sell_price = row["sell_price"] or 0
+
+            buy_sold_1d = row["buy_sold_1d"] or 0
+            sell_sold_1d = row["sell_sold_1d"] or 0
+            buy_sold_7d = row["buy_sold_7d"] or 0
+            sell_sold_7d = row["sell_sold_7d"] or 0
+            buy_sold_30d = row["buy_sold_30d"] or 0
+            sell_sold_30d = row["sell_sold_30d"] or 0
+
+            buy_velocity_1d = (buy_sold_1d * buy_price) / 10000.0
+            sell_velocity_1d = (sell_sold_1d * sell_price) / 10000.0
+            buy_velocity_7d = ((buy_sold_7d / 7.0) * buy_price) / 10000.0
+            sell_velocity_7d = ((sell_sold_7d / 7.0) * sell_price) / 10000.0
+            buy_velocity_30d = ((buy_sold_30d / 30.0) * buy_price) / 10000.0
+            sell_velocity_30d = ((sell_sold_30d / 30.0) * sell_price) / 10000.0
+
+            flip_score = 0.0
+            if buy_price > 0 and sell_price > 0:
+                percent_profit = calc_percent_profit(
+                    buy_price,
+                    sell_price,
+                    row["vendor_value"],
+                )
+                flip_score = calc_flip_score(
+                    buy_sold_1d,
+                    sell_sold_1d,
+                    buy_price,
+                    percent_profit,
+                )
+
+            updates.append(
+                (
+                    buy_velocity_1d,
+                    sell_velocity_1d,
+                    buy_velocity_7d,
+                    sell_velocity_7d,
+                    buy_velocity_30d,
+                    sell_velocity_30d,
+                    flip_score,
+                    row["id"],
+                )
+            )
+
+        cursor.executemany(
+            """
+            UPDATE items SET
+                buy_velocity_1d = ?,
+                sell_velocity_1d = ?,
+                buy_velocity_7d = ?,
+                sell_velocity_7d = ?,
+                buy_velocity_30d = ?,
+                sell_velocity_30d = ?,
+                flip_score = ?
+            WHERE id = ?
+            """,
+            updates,
         )
 
         conn.commit()
@@ -383,10 +412,10 @@ class Database:
         cursor.execute(
             """
             SELECT * FROM items
-            WHERE buy_velocity_1d IS NOT NULL
-            AND sell_velocity_1d IS NOT NULL
-            AND buy_velocity_1d > 0
-            AND sell_velocity_1d > 0
+            WHERE buy_price > 0
+            AND sell_price > 0
+            AND buy_sold_1d > 0
+            AND sell_sold_1d > 0
             """
         )
         rows = cursor.fetchall()
@@ -406,7 +435,7 @@ class Database:
             AND buy_price > 0
             AND sell_price > 0
             AND sell_price > buy_price
-            ORDER BY (sell_price - buy_price) DESC
+            ORDER BY COALESCE(flip_score, 0) DESC, (sell_price - buy_price) DESC
             LIMIT ?
             """,
             (limit,),
@@ -445,6 +474,7 @@ class Database:
             price_pressure=row["price_pressure"],
             buy_price_min_yesterday=row["buy_price_min_yesterday"],
             sell_price_max_yesterday=row["sell_price_max_yesterday"],
+            flip_score=row["flip_score"],
             price_updated=row["price_updated"],
             velocity_updated=row["velocity_updated"],
         )

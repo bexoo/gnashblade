@@ -32,6 +32,7 @@ def test_watch_deep_refresh_runs_on_first_loop_and_interval(monkeypatch):
         deep_refresh_seconds=120,
         history_workers=8,
         orderbook_workers=8,
+        fetch_order_books=False,
         limit=10,
         min_profit=0.0,
         max_profit=None,
