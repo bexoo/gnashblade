@@ -1,12 +1,10 @@
+import asyncio
 import csv
 import io
-import threading
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import Optional
 
-import requests
+import httpx
 
 from lib.models import HistoryEntry, ItemPrice, OrderBook
 
@@ -27,47 +25,51 @@ class DataWars2Client:
         self.rate_limit_delay = rate_limit_delay
         self.max_retries = max_retries
         self.backoff_base = backoff_base
-        self._thread_local = threading.local()
+        self._client: Optional[httpx.AsyncClient] = None
 
-    def _get_session(self) -> requests.Session:
-        session = getattr(self._thread_local, "session", None)
-        if session is None:
-            session = requests.Session()
-            self._thread_local.session = session
-        return session
+    async def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=self.timeout)
+        return self._client
 
-    def _request(self, url: str, params: Optional[dict] = None) -> requests.Response:
+    async def close(self) -> None:
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    async def _request(self, url: str, params: Optional[dict] = None) -> httpx.Response:
         for attempt in range(self.max_retries + 1):
-            session = self._get_session()
+            client = await self._get_client()
             try:
-                response = session.get(url, params=params, timeout=self.timeout)
+                response = await client.get(url, params=params)
                 if response.status_code in RETRIABLE_STATUS_CODES:
-                    raise requests.HTTPError(
+                    raise httpx.HTTPStatusError(
                         f"Retriable HTTP status: {response.status_code}",
+                        request=response.request,
                         response=response,
                     )
                 response.raise_for_status()
                 if self.rate_limit_delay > 0:
-                    time.sleep(self.rate_limit_delay)
+                    await asyncio.sleep(self.rate_limit_delay)
                 return response
-            except requests.HTTPError as exc:
+            except httpx.HTTPStatusError as exc:
                 status_code = exc.response.status_code if exc.response else None
                 should_retry = status_code in RETRIABLE_STATUS_CODES
                 if not should_retry or attempt >= self.max_retries:
                     raise
-            except requests.RequestException:
+            except httpx.RequestError:
                 if attempt >= self.max_retries:
                     raise
 
             backoff_seconds = self.backoff_base * (2**attempt)
             if backoff_seconds > 0:
-                time.sleep(backoff_seconds)
+                await asyncio.sleep(backoff_seconds)
 
         raise RuntimeError("Unreachable: request loop exited without returning/raising")
 
-    def fetch_all_items(self) -> list[ItemPrice]:
+    async def fetch_all_items(self) -> list[ItemPrice]:
         url = f"{self.BASE_URL}/items/csv"
-        response = self._request(url)
+        response = await self._request(url)
 
         items = []
         reader = csv.DictReader(io.StringIO(response.text))
@@ -87,7 +89,7 @@ class DataWars2Client:
 
         return items
 
-    def fetch_history(self, item_id: int, days: int = 7) -> list[HistoryEntry]:
+    async def fetch_history(self, item_id: int, days: int = 7) -> list[HistoryEntry]:
         url = f"{self.BASE_URL}/history"
         end_date = datetime.utcnow()
         start_date = end_date - timedelta(days=days)
@@ -98,7 +100,7 @@ class DataWars2Client:
             "end": end_date.strftime("%Y-%m-%d"),
         }
 
-        response = self._request(url, params)
+        response = await self._request(url, params)
         data = response.json()
 
         entries = []
@@ -129,30 +131,28 @@ class DataWars2Client:
 
         return entries
 
-    def fetch_history_batch(
+    async def fetch_history_batch(
         self,
         item_ids: list[int],
         days: int = 1,
-        max_workers: int = 32,
+        max_concurrent: int = 32,
     ) -> dict[int, list[HistoryEntry]]:
         if not item_ids:
             return {}
 
-        worker_count = max(1, min(max_workers, len(item_ids)))
-        results = {item_id: [] for item_id in item_ids}
+        semaphore = asyncio.Semaphore(max_concurrent)
 
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            future_to_item_id = {
-                executor.submit(self.fetch_history, item_id, days): item_id
-                for item_id in item_ids
-            }
-            for future in as_completed(future_to_item_id):
-                item_id = future_to_item_id[future]
+        async def fetch_with_semaphore(item_id: int) -> tuple[int, list[HistoryEntry]]:
+            async with semaphore:
                 try:
-                    results[item_id] = future.result()
-                except requests.RequestException:
-                    results[item_id] = []
-        return results
+                    result = await self.fetch_history(item_id, days)
+                    return (item_id, result)
+                except Exception:
+                    return (item_id, [])
+
+        tasks = [fetch_with_semaphore(item_id) for item_id in item_ids]
+        results_list = await asyncio.gather(*tasks)
+        return dict(results_list)
 
     @staticmethod
     def _parse_int(value: Optional[str]) -> Optional[int]:
@@ -178,98 +178,109 @@ class GW2Client:
         self.rate_limit_delay = rate_limit_delay
         self.max_retries = max_retries
         self.backoff_base = backoff_base
-        self._thread_local = threading.local()
+        self._client: Optional[httpx.AsyncClient] = None
 
-    def _get_session(self) -> requests.Session:
-        session = getattr(self._thread_local, "session", None)
-        if session is None:
-            session = requests.Session()
-            self._thread_local.session = session
-        return session
+    async def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=self.timeout)
+        return self._client
 
-    def _request(self, url: str) -> requests.Response:
+    async def close(self) -> None:
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    async def _request(self, url: str) -> httpx.Response:
         for attempt in range(self.max_retries + 1):
-            session = self._get_session()
+            client = await self._get_client()
             try:
-                response = session.get(url, timeout=self.timeout)
+                response = await client.get(url)
                 if response.status_code in RETRIABLE_STATUS_CODES:
-                    raise requests.HTTPError(
+                    raise httpx.HTTPStatusError(
                         f"Retriable HTTP status: {response.status_code}",
+                        request=response.request,
                         response=response,
                     )
                 response.raise_for_status()
                 if self.rate_limit_delay > 0:
-                    time.sleep(self.rate_limit_delay)
+                    await asyncio.sleep(self.rate_limit_delay)
                 return response
-            except requests.HTTPError as exc:
+            except httpx.HTTPStatusError as exc:
                 status_code = exc.response.status_code if exc.response else None
                 should_retry = status_code in RETRIABLE_STATUS_CODES
                 if not should_retry or attempt >= self.max_retries:
                     raise
-            except requests.RequestException:
+            except httpx.RequestError:
                 if attempt >= self.max_retries:
                     raise
 
             backoff_seconds = self.backoff_base * (2**attempt)
             if backoff_seconds > 0:
-                time.sleep(backoff_seconds)
+                await asyncio.sleep(backoff_seconds)
 
         raise RuntimeError("Unreachable: request loop exited without returning/raising")
 
-    def fetch_order_book(self, item_id: int) -> Optional[OrderBook]:
+    async def fetch_order_book(self, item_id: int) -> Optional[OrderBook]:
         url = f"{self.BASE_URL}/commerce/listings/{item_id}"
         try:
-            response = self._request(url)
+            response = await self._request(url)
             data = response.json()
             return OrderBook(
                 item_id=item_id,
                 buys=data.get("buys", []),
                 sells=data.get("sells", []),
             )
-        except requests.RequestException:
+        except httpx.HTTPStatusError:
+            return None
+        except httpx.RequestError:
             return None
 
-    def fetch_items_batch(self, item_ids: list[int]) -> dict[int, dict]:
-        """Fetch item details (like vendor_value) from GW2 API in batches of 200."""
+    async def fetch_items_batch(self, item_ids: list[int]) -> dict[int, dict]:
         results = {}
-        # API allows max 200 ids per request
         chunk_size = 200
         for i in range(0, len(item_ids), chunk_size):
             chunk = item_ids[i:i + chunk_size]
             ids_str = ",".join(map(str, chunk))
             url = f"{self.BASE_URL}/items?ids={ids_str}"
             try:
-                response = self._request(url)
+                response = await self._request(url)
                 data = response.json()
                 for item in data:
                     results[item["id"]] = item
-            except requests.RequestException:
+            except httpx.HTTPStatusError:
+                continue
+            except httpx.RequestError:
                 continue
         return results
 
-    def fetch_order_books_batch(
-        self, item_ids: list[int], max_workers: int = 32
+    async def fetch_order_books_batch(
+        self, item_ids: list[int], max_concurrent: int = 32
     ) -> dict[int, OrderBook]:
         if not item_ids:
             return {}
 
         chunk_size = 200
+        item_chunks = [
+            item_ids[i:i + chunk_size]
+            for i in range(0, len(item_ids), chunk_size)
+        ]
+
+        semaphore = asyncio.Semaphore(max_concurrent)
+
+        async def fetch_chunk(chunk: list[int]) -> dict[int, OrderBook]:
+            async with semaphore:
+                return await self._fetch_order_books_chunk(chunk)
+
+        tasks = [fetch_chunk(chunk) for chunk in item_chunks]
+        results_list = await asyncio.gather(*tasks)
+
         results: dict[int, OrderBook] = {}
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = []
-            for i in range(0, len(item_ids), chunk_size):
-                chunk = item_ids[i:i + chunk_size]
-                futures.append(executor.submit(self._fetch_order_books_chunk, chunk))
-
-            for future in as_completed(futures):
-                chunk_results = future.result()
-                results.update(chunk_results)
+        for chunk_results in results_list:
+            results.update(chunk_results)
 
         return results
 
-    def _fetch_order_books_chunk(self, item_ids: list[int]) -> dict[int, OrderBook]:
-        """Fetch order books for multiple items using batch API."""
+    async def _fetch_order_books_chunk(self, item_ids: list[int]) -> dict[int, OrderBook]:
         if not item_ids:
             return {}
 
@@ -277,7 +288,7 @@ class GW2Client:
         url = f"{self.BASE_URL}/commerce/listings?ids={ids_str}"
 
         try:
-            response = self._request(url)
+            response = await self._request(url)
             data = response.json()
             results = {}
             for item_data in data:
@@ -289,5 +300,7 @@ class GW2Client:
                         sells=item_data.get("sells", []),
                     )
             return results
-        except requests.RequestException:
+        except httpx.HTTPStatusError:
+            return {}
+        except httpx.RequestError:
             return {}

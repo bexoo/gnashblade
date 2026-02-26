@@ -8,24 +8,28 @@ def test_watch_deep_refresh_runs_on_first_loop_and_interval(monkeypatch):
     now = {"value": 0.0}
     sleep_calls = {"count": 0}
 
+    class DummyClient:
+        def __init__(self):
+            self._client = None
+
     monkeypatch.setattr(gw2_trader, "Database", lambda: object())
-    monkeypatch.setattr(gw2_trader, "DataWars2Client", lambda: object())
-    monkeypatch.setattr(gw2_trader, "GW2Client", lambda: object())
+    monkeypatch.setattr(gw2_trader, "DataWars2Client", lambda: DummyClient())
+    monkeypatch.setattr(gw2_trader, "GW2Client", lambda: DummyClient())
     monkeypatch.setattr(gw2_trader, "cmd_flips", lambda args: 0)
 
-    def fake_run_update_cycle(**kwargs):
+    async def fake_run_update_cycle(**kwargs):
         deep_refresh_flags.append(kwargs["deep_refresh"])
 
     monkeypatch.setattr(gw2_trader, "_run_update_cycle", fake_run_update_cycle)
     monkeypatch.setattr(gw2_trader.time, "time", lambda: now["value"])
 
-    def fake_sleep(seconds: float):
+    async def fake_sleep(seconds: float):
         now["value"] += seconds
         sleep_calls["count"] += 1
         if sleep_calls["count"] >= 3:
             raise KeyboardInterrupt()
 
-    monkeypatch.setattr(gw2_trader.time, "sleep", fake_sleep)
+    monkeypatch.setattr("gw2_trader.asyncio.sleep", fake_sleep)
 
     args = argparse.Namespace(
         interval=60,

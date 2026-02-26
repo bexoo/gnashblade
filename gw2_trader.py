@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import asyncio
 import sys
 import time
 from typing import Optional
@@ -86,7 +87,7 @@ def _log_stage_timing(stage_name: str, started_at: float) -> None:
     vlog(f"[timing] {stage_name}: {elapsed:.2f}s")
 
 
-def _run_update_cycle(
+async def _run_update_cycle(
     db: Database,
     dw2: DataWars2Client,
     gw2: GW2Client,
@@ -100,7 +101,7 @@ def _run_update_cycle(
 
     prices_started = time.perf_counter()
     log("Fetching all item prices...")
-    items = dw2.fetch_all_items()
+    items = await dw2.fetch_all_items()
     vlog(f"Found {len(items)} items")
     _log_stage_timing("fetch prices", prices_started)
 
@@ -115,7 +116,7 @@ def _run_update_cycle(
     if missing_items:
         vlog(f"Fetching vendor values for {len(missing_items)} items...")
         item_ids_missing = [item.id for item in missing_items]
-        vendor_data = gw2.fetch_items_batch(item_ids_missing)
+        vendor_data = await gw2.fetch_items_batch(item_ids_missing)
         vendor_values = {
             item_id: data.get("vendor_value", 0)
             for item_id, data in vendor_data.items()
@@ -146,13 +147,13 @@ def _run_update_cycle(
     item_ids = [candidate.id for candidate in candidates]
     log(
         f"Fetching history for {len(candidates)} candidates "
-        f"({max(1, history_workers)} workers)..."
+        f"({max(1, history_workers)} concurrent)..."
     )
     history_started = time.perf_counter()
-    history_data = dw2.fetch_history_batch(
+    history_data = await dw2.fetch_history_batch(
         item_ids,
         days=30,
-        max_workers=history_workers,
+        max_concurrent=history_workers,
     )
     _log_stage_timing("fetch history", history_started)
 
@@ -203,12 +204,12 @@ def _run_update_cycle(
     if fetch_order_books:
         log(
             f"Fetching order books for {len(order_book_item_ids)} candidates "
-            f"({max(1, orderbook_workers)} workers)..."
+            f"({max(1, orderbook_workers)} concurrent)..."
         )
         order_book_fetch_started = time.perf_counter()
-        order_books = gw2.fetch_order_books_batch(
+        order_books = await gw2.fetch_order_books_batch(
             order_book_item_ids,
-            max_workers=orderbook_workers,
+            max_concurrent=orderbook_workers,
         )
         _log_stage_timing("fetch order books", order_book_fetch_started)
 
@@ -242,16 +243,24 @@ def cmd_update(args: argparse.Namespace) -> int:
     dw2 = DataWars2Client()
     gw2 = GW2Client()
 
-    _run_update_cycle(
-        db=db,
-        dw2=dw2,
-        gw2=gw2,
-        full=args.full,
-        deep_refresh=True,
-        history_workers=args.history_workers,
-        orderbook_workers=args.orderbook_workers,
-        fetch_order_books=args.fetch_order_books,
-    )
+    try:
+        asyncio.run(
+            _run_update_cycle(
+                db=db,
+                dw2=dw2,
+                gw2=gw2,
+                full=args.full,
+                deep_refresh=True,
+                history_workers=args.history_workers,
+                orderbook_workers=args.orderbook_workers,
+                fetch_order_books=args.fetch_order_books,
+            )
+        )
+    finally:
+        if dw2._client is not None:
+            dw2._client = None
+        if gw2._client is not None:
+            gw2._client = None
 
     log("Update complete!")
     return 0
@@ -352,26 +361,33 @@ def cmd_item(args: argparse.Namespace) -> int:
             print(
                 f"Item with ID {item_id} not found in database. Try running 'update' first."
             )
+            asyncio.run(gw2.close())
+            asyncio.run(datawars.close())
             return 1
     except ValueError:
         # Search by name
         items = db.search_items(query)
         if not items:
             print(f"No items found matching '{query}'. Try a different search term.")
+            asyncio.run(gw2.close())
+            asyncio.run(datawars.close())
             return 1
         if len(items) > 1:
             print(f"Multiple matches found for '{query}':\n")
             for i, item in enumerate(items, 1):
                 print(f"  {i}. {item.name} (ID: {item.id})")
             print("\nRun with a more specific query or use the ID.")
+            asyncio.run(gw2.close())
+            asyncio.run(datawars.close())
             return 0
 
     item = items[0]
+    order_book = None
 
     # Fetch fresh history if requested
     if args.history:
         print("Fetching fresh history data...")
-        history = datawars.fetch_history(item.id, days=30)
+        history = asyncio.run(datawars.fetch_history(item.id, days=30))
         if history:
             latest = history[0]
             item.buy_velocity_1d = float(latest.buy_sold)
@@ -383,7 +399,12 @@ def cmd_item(args: argparse.Namespace) -> int:
     flip_result_30d = calculate_flip_result(item, days=30)
 
     # Fetch order book from GW2 API
-    order_book = gw2.fetch_order_book(item.id)
+    order_book = asyncio.run(gw2.fetch_order_book(item.id))
+
+    if gw2._client is not None:
+        gw2._client = None
+    if datawars._client is not None:
+        datawars._client = None
 
     # Print all the information
     print(f"\n{'=' * 60}")
@@ -478,6 +499,61 @@ def cmd_item(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _run_watch_loop(
+    db: Database,
+    dw2: DataWars2Client,
+    gw2: GW2Client,
+    interval: int,
+    deep_refresh_seconds: int,
+    history_workers: int,
+    orderbook_workers: int,
+    fetch_order_books: bool,
+    limit: int,
+    min_profit: float,
+    max_profit: Optional[float],
+    max_price: int,
+    min_sold: int,
+    min_bought: int,
+) -> None:
+    last_deep_refresh_at: Optional[float] = None
+
+    while True:
+        try:
+            now = time.time()
+            deep_refresh_due = (
+                last_deep_refresh_at is None
+                or (now - last_deep_refresh_at) >= deep_refresh_seconds
+            )
+            await _run_update_cycle(
+                db=db,
+                dw2=dw2,
+                gw2=gw2,
+                full=False,
+                deep_refresh=deep_refresh_due,
+                history_workers=history_workers,
+                orderbook_workers=orderbook_workers,
+                fetch_order_books=fetch_order_books,
+            )
+            if deep_refresh_due:
+                last_deep_refresh_at = now
+
+            flips_args = argparse.Namespace(
+                days=1,
+                limit=limit,
+                min_profit=min_profit,
+                max_profit=max_profit,
+                max_price=max_price,
+                min_sold=min_sold,
+                min_bought=min_bought,
+            )
+            cmd_flips(flips_args)
+
+            print(f"\nNext update in {interval} seconds...")
+            await asyncio.sleep(interval)
+        except KeyboardInterrupt:
+            raise
+
+
 def cmd_watch(args: argparse.Namespace) -> int:
     global VERBOSE, SILENT
     VERBOSE = False
@@ -496,30 +572,18 @@ def cmd_watch(args: argparse.Namespace) -> int:
     db = Database()
     dw2 = DataWars2Client()
     gw2 = GW2Client()
-    last_deep_refresh_at: Optional[float] = None
 
-    while True:
-        try:
-            now = time.time()
-            deep_refresh_due = (
-                last_deep_refresh_at is None
-                or (now - last_deep_refresh_at) >= deep_refresh_seconds
-            )
-            _run_update_cycle(
+    try:
+        asyncio.run(
+            _run_watch_loop(
                 db=db,
                 dw2=dw2,
                 gw2=gw2,
-                full=False,
-                deep_refresh=deep_refresh_due,
+                interval=interval,
+                deep_refresh_seconds=deep_refresh_seconds,
                 history_workers=args.history_workers,
                 orderbook_workers=args.orderbook_workers,
                 fetch_order_books=args.fetch_order_books,
-            )
-            if deep_refresh_due:
-                last_deep_refresh_at = now
-
-            flips_args = argparse.Namespace(
-                days=1,
                 limit=args.limit,
                 min_profit=args.min_profit,
                 max_profit=args.max_profit,
@@ -527,13 +591,16 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 min_sold=args.min_sold,
                 min_bought=args.min_bought,
             )
-            cmd_flips(flips_args)
+        )
+    except KeyboardInterrupt:
+        print("\nWatch mode stopped.")
+    finally:
+        if dw2._client is not None:
+            dw2._client = None
+        if gw2._client is not None:
+            gw2._client = None
 
-            print(f"\nNext update in {interval} seconds...")
-            time.sleep(interval)
-        except KeyboardInterrupt:
-            print("\nWatch mode stopped.")
-            return 0
+    return 0
 
 
 def main() -> int:

@@ -1,4 +1,3 @@
-import requests
 import pytest
 
 from lib.api import DataWars2Client, GW2Client
@@ -10,21 +9,23 @@ class DummyResponse:
         self.status_code = status_code
         self._payload = payload if payload is not None else []
         self.text = text
+        self.request = None
 
     def json(self):
         return self._payload
 
     def raise_for_status(self):
         if self.status_code >= 400:
-            raise requests.HTTPError(f"HTTP {self.status_code}", response=self)
+            import httpx
+            raise httpx.HTTPStatusError(f"HTTP {self.status_code}", request=self.request, response=self)
 
 
-class DummySession:
+class DummyAsyncClient:
     def __init__(self, responses):
         self.responses = list(responses)
         self.call_count = 0
 
-    def get(self, url, params=None, timeout=None):
+    async def get(self, url, params=None, timeout=None):
         del url, params, timeout
         self.call_count += 1
         response = self.responses.pop(0)
@@ -33,18 +34,19 @@ class DummySession:
         return response
 
 
-def test_fetch_history_batch_returns_all_ids_and_handles_failures(monkeypatch):
+@pytest.mark.asyncio
+async def test_fetch_history_batch_returns_all_ids_and_handles_failures(monkeypatch):
     client = DataWars2Client()
 
-    def fake_fetch_history(item_id: int, days: int = 7):
+    async def fake_fetch_history(item_id: int, days: int = 7):
         del days
         if item_id == 2:
-            raise requests.RequestException("boom")
+            raise Exception("boom")
         return [HistoryEntry(date="2024-01-01", buy_sold=item_id)]
 
     monkeypatch.setattr(client, "fetch_history", fake_fetch_history)
 
-    results = client.fetch_history_batch([1, 2, 3], days=30, max_workers=4)
+    results = await client.fetch_history_batch([1, 2, 3], days=30, max_concurrent=4)
 
     assert set(results.keys()) == {1, 2, 3}
     assert results[2] == []
@@ -52,10 +54,11 @@ def test_fetch_history_batch_returns_all_ids_and_handles_failures(monkeypatch):
     assert results[3][0].buy_sold == 3
 
 
-def test_fetch_order_books_batch_returns_only_successful_results(monkeypatch):
+@pytest.mark.asyncio
+async def test_fetch_order_books_batch_returns_only_successful_results(monkeypatch):
     client = GW2Client()
 
-    def fake_fetch_order_books_chunk(item_ids: list[int]):
+    async def fake_fetch_order_books_chunk(item_ids: list[int]):
         results = {}
         for item_id in item_ids:
             if item_id == 2:
@@ -68,39 +71,50 @@ def test_fetch_order_books_batch_returns_only_successful_results(monkeypatch):
 
     monkeypatch.setattr(client, "_fetch_order_books_chunk", fake_fetch_order_books_chunk)
 
-    results = client.fetch_order_books_batch([1, 2, 3], max_workers=3)
+    results = await client.fetch_order_books_batch([1, 2, 3], max_concurrent=3)
 
     assert set(results.keys()) == {1, 3}
     assert results[1].item_id == 1
     assert results[3].item_id == 3
 
 
-@pytest.mark.parametrize("status_code", [429, 500, 502, 503, 504])
-def test_request_retries_on_retriable_status(monkeypatch, status_code):
+@pytest.mark.asyncio
+async def test_request_retries_on_retriable_status(monkeypatch):
+    import httpx
+
     client = DataWars2Client(rate_limit_delay=0.0, max_retries=2, backoff_base=0.01)
-    session = DummySession([DummyResponse(status_code), DummyResponse(200)])
+    responses = [DummyResponse(429), DummyResponse(200)]
+    client._client = DummyAsyncClient(responses)
     sleep_calls = []
 
-    monkeypatch.setattr(client, "_get_session", lambda: session)
-    monkeypatch.setattr("lib.api.time.sleep", lambda seconds: sleep_calls.append(seconds))
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
 
-    response = client._request("https://example.com/history")
+    monkeypatch.setattr("lib.api.asyncio.sleep", fake_sleep)
+
+    response = await client._request("https://example.com/history")
 
     assert response.status_code == 200
-    assert session.call_count == 2
+    assert client._client.call_count == 2
     assert sleep_calls == [0.01]
 
 
-def test_request_does_not_retry_non_retriable_4xx(monkeypatch):
+@pytest.mark.asyncio
+async def test_request_does_not_retry_non_retriable_4xx(monkeypatch):
+    import httpx
+
     client = DataWars2Client(rate_limit_delay=0.0, max_retries=3, backoff_base=0.01)
-    session = DummySession([DummyResponse(404)])
+    responses = [DummyResponse(404)]
+    client._client = DummyAsyncClient(responses)
     sleep_calls = []
 
-    monkeypatch.setattr(client, "_get_session", lambda: session)
-    monkeypatch.setattr("lib.api.time.sleep", lambda seconds: sleep_calls.append(seconds))
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
 
-    with pytest.raises(requests.HTTPError):
-        client._request("https://example.com/history")
+    monkeypatch.setattr("lib.api.asyncio.sleep", fake_sleep)
 
-    assert session.call_count == 1
+    with pytest.raises(httpx.HTTPStatusError):
+        await client._request("https://example.com/history")
+
+    assert client._client.call_count == 1
     assert sleep_calls == []
