@@ -1,6 +1,6 @@
 # Gnashblade
 
-A Python-based Guild Wars 2 trading bot that uses the DataWars2 and GW2 APIs to track item prices, calculate velocity metrics, identify profitable flips, and measure market competition. The project uses SQLite for data storage.
+A Python-based trading utility for Guild Wars 2 that uses the DataWars2 and GW2 APIs to track item prices, calculate velocity metrics, identify profitable flips, and measure market competition.
 
 ## Architecture
 
@@ -73,10 +73,3 @@ flip_score = flip_velocity * (percent_profit / 100)  # gold profit per day
 | Order book tiers | GW2 Official | `/v2/commerce/listings/{id}` |
 
 Note: DataWars2 `buy_value`/`sell_value` is in copper — divide by 10000 for gold.
-
-
-## Known Issues
-- **Slow updates**: History fetches are sequential (500+ API calls). Could benefit from async/parallel fetching.
-- **Order book data sparse**: Many top flip items lack competition data because full update takes a long time and gets interrupted.
-- **No caching**: Re-fetches all data even if recent. Could skip items updated within the last N minutes.
-- **Outliers**: Some items have flip scores that are suspiciously high (items with 200%+ profit margin should generally not have high flip scores due to low velocity).
